@@ -1,6 +1,10 @@
 // Whatsapp plugin module implements on message behavior.
 import type { AckReactionHandle } from "openclaw/plugin-sdk/channel-feedback";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import {
+  ensureConfiguredBindingRouteReady,
+  resolveConfiguredBindingRoute,
+} from "openclaw/plugin-sdk/conversation-binding-runtime";
 import type { getReplyFromConfig } from "openclaw/plugin-sdk/reply-runtime";
 import type { MsgContext } from "openclaw/plugin-sdk/reply-runtime";
 import { resolveAgentRoute } from "openclaw/plugin-sdk/routing";
@@ -138,20 +142,36 @@ export function createWebOnMessageHandler(params: {
         id: peerId,
       },
     });
-    const route =
+    const routeBeforeConfiguredBinding =
       msg.chatType === "group" ? resolveWhatsAppGroupSessionRoute(baseRoute) : baseRoute;
+    let route = routeBeforeConfiguredBinding;
+    const configuredRoute = resolveConfiguredBindingRoute({
+      cfg,
+      route,
+      conversation: {
+        channel: "whatsapp",
+        accountId: route.accountId,
+        conversationId: peerId,
+      },
+    });
+    const configuredBinding = configuredRoute.bindingResolution;
+    const configuredBindingSessionKey = configuredRoute.boundSessionKey ?? "";
+    route = configuredRoute.route;
+    const broadcastAgents = cfg.broadcast?.[peerId];
+    const shouldAttemptBroadcast = Array.isArray(broadcastAgents) && broadcastAgents.length > 0;
+    const inboundRoute = shouldAttemptBroadcast ? routeBeforeConfiguredBinding : route;
     const groupHistoryKey =
       msg.chatType === "group"
         ? buildGroupHistoryKey({
             channel: "whatsapp",
-            accountId: route.accountId,
+            accountId: inboundRoute.accountId,
             peerKind: "group",
             peerId,
           })
-        : route.sessionKey;
+        : inboundRoute.sessionKey;
     const account = resolveWhatsAppAccount({
       cfg,
-      accountId: route.accountId ?? msg.accountId ?? params.account.accountId,
+      accountId: inboundRoute.accountId ?? msg.accountId ?? params.account.accountId,
     });
     const baseMentionConfig = buildMentionConfig(cfg);
 
@@ -182,7 +202,7 @@ export function createWebOnMessageHandler(params: {
     let ackAlreadySent = false;
     let ackReaction: AckReactionHandle | null = null;
     let statusReactionController: StatusReactionController | null = null;
-    const runAudioPreflightOnce = async () => {
+    const runAudioPreflightOnce = async (preflightRoute = route) => {
       if (
         preflightAudioTranscript !== undefined ||
         !canRunEarlyAudioPreflight ||
@@ -195,11 +215,11 @@ export function createWebOnMessageHandler(params: {
         statusReactionController = await createWhatsAppStatusReactionController({
           cfg,
           msg,
-          agentId: route.agentId,
-          sessionKey: route.sessionKey,
+          agentId: preflightRoute.agentId,
+          sessionKey: preflightRoute.sessionKey,
           conversationId,
           verbose: params.verbose,
-          accountId: route.accountId,
+          accountId: preflightRoute.accountId,
         });
         if (statusReactionController) {
           await statusReactionController.setQueued();
@@ -208,11 +228,11 @@ export function createWebOnMessageHandler(params: {
         ackReaction = await maybeSendAckReaction({
           cfg,
           msg,
-          agentId: route.agentId,
-          sessionKey: route.sessionKey,
+          agentId: preflightRoute.agentId,
+          sessionKey: preflightRoute.sessionKey,
           conversationId,
           verbose: params.verbose,
-          accountId: route.accountId,
+          accountId: preflightRoute.accountId,
           info: params.replyLogger.info.bind(params.replyLogger),
           warn: params.replyLogger.warn.bind(params.replyLogger),
         });
@@ -233,7 +253,7 @@ export function createWebOnMessageHandler(params: {
               Surface: "whatsapp",
               OriginatingChannel: "whatsapp",
               OriginatingTo: conversationId,
-              AccountId: route.accountId,
+              AccountId: preflightRoute.accountId,
             },
             cfg,
           })) ?? null;
@@ -242,14 +262,31 @@ export function createWebOnMessageHandler(params: {
         preflightAudioTranscript = null;
       }
     };
+    const runBroadcastRoute = async (broadcastRoute = route) =>
+      await maybeBroadcastMessage({
+        cfg,
+        msg,
+        peerId,
+        route: broadcastRoute,
+        groupHistoryKey,
+        groupHistories: params.groupHistories,
+        ...(preflightAudioTranscript !== undefined ? { preflightAudioTranscript } : {}),
+        // Group ack eligibility depends on the target agent/session, so a
+        // preflight ack attempt on the base route must not suppress downstream
+        // per-agent checks during broadcast fan-out.
+        ...(ackAlreadySent && msg.chatType !== "group" ? { ackAlreadySent: true } : {}),
+        ...(ackReaction && msg.chatType !== "group" ? { ackReaction } : {}),
+        ...(statusReactionController && msg.chatType !== "group" ? { ackAlreadySent: true } : {}),
+        processMessage: (m, r, k, opts) => processForRoute(cfg, m, r, k, opts),
+      });
 
     if (msg.chatType === "group") {
       const sender = getSenderIdentity(msg);
       const metaCtx = {
         From: msg.from,
         To: msg.platform.recipientJid,
-        SessionKey: route.sessionKey,
-        AccountId: route.accountId,
+        SessionKey: inboundRoute.sessionKey,
+        AccountId: inboundRoute.accountId,
         ChatType: msg.chatType,
         ConversationLabel: conversationId,
         GroupSubject: msg.group?.subject,
@@ -264,11 +301,11 @@ export function createWebOnMessageHandler(params: {
       updateLastRouteInBackground({
         cfg,
         backgroundTasks: params.backgroundTasks,
-        storeAgentId: route.agentId,
-        sessionKey: route.sessionKey,
+        storeAgentId: inboundRoute.agentId,
+        sessionKey: inboundRoute.sessionKey,
         channel: "whatsapp",
         to: conversationId,
-        accountId: route.accountId,
+        accountId: inboundRoute.accountId,
         ctx: metaCtx,
         warn: params.replyLogger.warn.bind(params.replyLogger),
       });
@@ -279,8 +316,8 @@ export function createWebOnMessageHandler(params: {
         deferMissingMention: hasAudioBody && Boolean(msg.payload.media?.path),
         conversationId,
         groupHistoryKey,
-        agentId: route.agentId,
-        sessionKey: route.sessionKey,
+        agentId: inboundRoute.agentId,
+        sessionKey: inboundRoute.sessionKey,
         baseMentionConfig,
         providerMentionPatterns: account.mentionPatterns,
         authDir: account.authDir,
@@ -296,7 +333,7 @@ export function createWebOnMessageHandler(params: {
         "needsMentionText" in gating &&
         gating.needsMentionText === true
       ) {
-        await runAudioPreflightOnce();
+        await runAudioPreflightOnce(inboundRoute);
         gating = await applyGroupGating({
           cfg,
           msg,
@@ -305,8 +342,8 @@ export function createWebOnMessageHandler(params: {
             : {}),
           conversationId,
           groupHistoryKey,
-          agentId: route.agentId,
-          sessionKey: route.sessionKey,
+          agentId: inboundRoute.agentId,
+          sessionKey: inboundRoute.sessionKey,
           baseMentionConfig,
           providerMentionPatterns: account.mentionPatterns,
           authDir: account.authDir,
@@ -323,28 +360,34 @@ export function createWebOnMessageHandler(params: {
       }
     }
 
+    if (shouldAttemptBroadcast) {
+      await runAudioPreflightOnce(inboundRoute);
+      if (await runBroadcastRoute(inboundRoute)) {
+        return;
+      }
+    }
+
+    if (configuredBinding) {
+      const ensured = await ensureConfiguredBindingRouteReady({
+        cfg,
+        bindingResolution: configuredBinding,
+      });
+      if (!ensured.ok) {
+        logVerbose(
+          `whatsapp: configured ACP binding unavailable for ${peerId} -> ${configuredBindingSessionKey}: ${ensured.error}`,
+        );
+        return;
+      }
+      logVerbose(
+        `whatsapp: using configured ACP binding for ${peerId} -> ${configuredBindingSessionKey}`,
+      );
+    }
+
     await runAudioPreflightOnce();
 
     // Broadcast groups: when we'd reply anyway, run multiple agents.
     // Does not bypass group mention/activation gating above.
-    if (
-      await maybeBroadcastMessage({
-        cfg,
-        msg,
-        peerId,
-        route,
-        groupHistoryKey,
-        groupHistories: params.groupHistories,
-        ...(preflightAudioTranscript !== undefined ? { preflightAudioTranscript } : {}),
-        // Group ack eligibility depends on the target agent/session, so a
-        // preflight ack attempt on the base route must not suppress downstream
-        // per-agent checks during broadcast fan-out.
-        ...(ackAlreadySent && msg.chatType !== "group" ? { ackAlreadySent: true } : {}),
-        ...(ackReaction && msg.chatType !== "group" ? { ackReaction } : {}),
-        ...(statusReactionController && msg.chatType !== "group" ? { ackAlreadySent: true } : {}),
-        processMessage: (m, r, k, opts) => processForRoute(cfg, m, r, k, opts),
-      })
-    ) {
+    if (!shouldAttemptBroadcast && (await runBroadcastRoute())) {
       return;
     }
 

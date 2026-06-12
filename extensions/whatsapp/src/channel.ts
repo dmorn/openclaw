@@ -11,6 +11,7 @@ import { resolveWhatsAppAccount, type ResolvedWhatsAppAccount } from "./accounts
 import { createWhatsAppLoginTool } from "./agent-tools-login.js";
 import { whatsappApprovalCapability } from "./approval-native.js";
 import type { WebChannelStatus } from "./auto-reply/types.js";
+import { whatsappBindingsAdapter } from "./bindings.js";
 import {
   describeWhatsAppMessageActions,
   resolveWhatsAppAgentReactionGuidance,
@@ -108,6 +109,7 @@ export const whatsappPlugin: ChannelPlugin<ResolvedWhatsAppAccount> =
         stripRegexes: ({ ctx }) => resolveWhatsAppMentionStripRegexes(ctx),
       },
       commands: whatsappCommandPolicy,
+      bindings: whatsappBindingsAdapter,
       agentPrompt: {
         reactionGuidance: ({ cfg, accountId }) => {
           const level = resolveWhatsAppAgentReactionGuidance({

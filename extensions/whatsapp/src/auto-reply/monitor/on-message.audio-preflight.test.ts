@@ -7,6 +7,8 @@ const maybeSendAckReactionMock = vi.fn();
 const processMessageMock = vi.fn();
 const maybeBroadcastMessageMock = vi.fn();
 const createStatusReactionControllerMock = vi.fn();
+const resolveConfiguredBindingRouteMock = vi.fn();
+const ensureConfiguredBindingRouteReadyMock = vi.fn();
 const statusReactionController = {
   setQueued: vi.fn(async () => {
     events.push("status-queued");
@@ -52,6 +54,12 @@ vi.mock("./group-gating.js", () => ({
   applyGroupGating: (...args: unknown[]) => applyGroupGatingMock(...args),
 }));
 
+vi.mock("openclaw/plugin-sdk/conversation-binding-runtime", () => ({
+  resolveConfiguredBindingRoute: (...args: unknown[]) => resolveConfiguredBindingRouteMock(...args),
+  ensureConfiguredBindingRouteReady: (...args: unknown[]) =>
+    ensureConfiguredBindingRouteReadyMock(...args),
+}));
+
 vi.mock("./last-route.js", () => ({
   updateLastRouteInBackground: () => {},
 }));
@@ -93,7 +101,10 @@ vi.mock("openclaw/plugin-sdk/routing", () => ({
   }),
 }));
 
-import { createTestWebAudioInboundMessage } from "../../inbound/test-message.test-helper.js";
+import {
+  createTestWebAudioInboundMessage,
+  createTestWebInboundMessage,
+} from "../../inbound/test-message.test-helper.js";
 import type { WebInboundMessage } from "../../inbound/types.js";
 import { createWebOnMessageHandler } from "./on-message.js";
 
@@ -184,6 +195,13 @@ describe("createWebOnMessageHandler audio preflight", () => {
     Object.values(statusReactionController).forEach((mock) => mock.mockClear());
     applyGroupGatingMock.mockReset();
     applyGroupGatingMock.mockResolvedValue({ shouldProcess: true });
+    resolveConfiguredBindingRouteMock.mockReset();
+    resolveConfiguredBindingRouteMock.mockImplementation(({ route }: { route: unknown }) => ({
+      bindingResolution: null,
+      route,
+    }));
+    ensureConfiguredBindingRouteReadyMock.mockReset();
+    ensureConfiguredBindingRouteReadyMock.mockResolvedValue({ ok: true });
   });
 
   it("sends ack reaction before audio preflight for voice notes", async () => {
@@ -314,6 +332,175 @@ describe("createWebOnMessageHandler audio preflight", () => {
       OriginatingTo: "+15550000002",
       AccountId: "default",
     });
+  });
+
+  it("uses configured ACP routes before dispatching direct messages", async () => {
+    const boundSessionKey = "agent:sandboxed-agent:acp:binding:whatsapp:default:feedface";
+    const bindingResolution = {
+      record: {
+        conversation: {
+          conversationId: "+15551234567",
+        },
+      },
+    };
+    resolveConfiguredBindingRouteMock.mockImplementationOnce(
+      ({ route, conversation }: { route: Record<string, unknown>; conversation: unknown }) => {
+        expect(conversation).toEqual({
+          channel: "whatsapp",
+          accountId: "default",
+          conversationId: "+15551234567",
+        });
+        return {
+          bindingResolution,
+          boundSessionKey,
+          route: {
+            ...route,
+            agentId: "sandboxed-agent",
+            sessionKey: boundSessionKey,
+            matchedBy: "binding.channel",
+          },
+        };
+      },
+    );
+    const handler = makeHandler();
+
+    await handler(createTestWebInboundMessage());
+
+    expect(ensureConfiguredBindingRouteReadyMock).toHaveBeenCalledWith({
+      cfg: expect.any(Object),
+      bindingResolution,
+    });
+    expect(maybeBroadcastMessageMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        route: expect.objectContaining({
+          agentId: "sandboxed-agent",
+          sessionKey: boundSessionKey,
+          matchedBy: "binding.channel",
+        }),
+      }),
+    );
+    const processParams = mockObjectArg(processMessageMock, "processMessage");
+    expect(processParams.route).toMatchObject({
+      agentId: "sandboxed-agent",
+      sessionKey: boundSessionKey,
+      matchedBy: "binding.channel",
+    });
+  });
+
+  it("does not fall back to the embedded route when configured ACP readiness fails", async () => {
+    const bindingResolution = {
+      record: {
+        conversation: {
+          conversationId: "+15551234567",
+        },
+      },
+    };
+    resolveConfiguredBindingRouteMock.mockImplementationOnce(
+      ({ route }: { route: Record<string, unknown> }) => ({
+        bindingResolution,
+        boundSessionKey: "agent:sandboxed-agent:acp:binding:whatsapp:default:feedface",
+        route: {
+          ...route,
+          agentId: "sandboxed-agent",
+          sessionKey: "agent:sandboxed-agent:acp:binding:whatsapp:default:feedface",
+          matchedBy: "binding.channel",
+        },
+      }),
+    );
+    ensureConfiguredBindingRouteReadyMock.mockResolvedValueOnce({
+      ok: false,
+      error: "remote ACP unavailable",
+    });
+    const handler = makeHandler();
+
+    await handler(createTestWebInboundMessage());
+
+    expect(maybeBroadcastMessageMock).not.toHaveBeenCalled();
+    expect(processMessageMock).not.toHaveBeenCalled();
+  });
+
+  it("lets broadcast fan-out bypass configured ACP readiness", async () => {
+    const boundSessionKey = "agent:sandboxed-agent:acp:binding:whatsapp:default:feedface";
+    const bindingResolution = {
+      record: {
+        conversation: {
+          conversationId: "+15551234567",
+        },
+      },
+    };
+    resolveConfiguredBindingRouteMock.mockImplementationOnce(
+      ({ route }: { route: Record<string, unknown> }) => ({
+        bindingResolution,
+        boundSessionKey,
+        route: {
+          ...route,
+          agentId: "sandboxed-agent",
+          sessionKey: boundSessionKey,
+          matchedBy: "binding.channel",
+        },
+      }),
+    );
+    ensureConfiguredBindingRouteReadyMock.mockResolvedValueOnce({
+      ok: false,
+      error: "remote ACP unavailable",
+    });
+    maybeBroadcastMessageMock.mockResolvedValueOnce(true);
+    const handler = makeHandler({
+      cfg: {
+        channels: {
+          whatsapp: {
+            ackReaction: { enabled: true },
+          },
+        },
+        broadcast: {
+          "+15551234567": ["alfred"],
+        },
+      } as never,
+    });
+
+    await handler(createTestWebInboundMessage());
+
+    expect(ensureConfiguredBindingRouteReadyMock).not.toHaveBeenCalled();
+    const broadcastParams = mockObjectArg(maybeBroadcastMessageMock, "maybeBroadcastMessage");
+    expect(broadcastParams.route).toMatchObject({
+      agentId: "main",
+      sessionKey: "agent:main:whatsapp:+15550000002",
+    });
+    expect(broadcastParams.route).not.toMatchObject({
+      sessionKey: boundSessionKey,
+      matchedBy: "binding.channel",
+    });
+    expect(processMessageMock).not.toHaveBeenCalled();
+  });
+
+  it("does not initialize configured ACP routes for group messages dropped by gating", async () => {
+    applyGroupGatingMock.mockResolvedValueOnce({ shouldProcess: false });
+    const bindingResolution = {
+      record: {
+        conversation: {
+          conversationId: "1203630@g.us",
+        },
+      },
+    };
+    resolveConfiguredBindingRouteMock.mockImplementationOnce(
+      ({ route }: { route: Record<string, unknown> }) => ({
+        bindingResolution,
+        boundSessionKey: "agent:sandboxed-agent:acp:binding:whatsapp:default:feedface",
+        route: {
+          ...route,
+          agentId: "sandboxed-agent",
+          sessionKey: "agent:sandboxed-agent:acp:binding:whatsapp:default:feedface",
+          matchedBy: "binding.channel",
+        },
+      }),
+    );
+    const handler = makeHandler();
+
+    await handler(makeGroupAudioMsg());
+
+    expect(ensureConfiguredBindingRouteReadyMock).not.toHaveBeenCalled();
+    expect(transcribeFirstAudioMock).not.toHaveBeenCalled();
+    expect(processMessageMock).not.toHaveBeenCalled();
   });
 
   it("does not transcribe group voice when policy gating rejects before mention", async () => {
